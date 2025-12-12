@@ -1,0 +1,77 @@
+name: Auto Retrain (scheduled)
+
+# Run daily at 02:00 UTC (adjust schedule as needed)
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch: {}   # allows manual run from Actions tab
+
+jobs:
+  auto-retrain:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUNBUFFERED: 1
+      # If you want the workflow to push a Docker image, set PUSH_DOCKER to "true"
+      PUSH_DOCKER: ${{ secrets.PUSH_DOCKER | default('false') }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Show repo status (debug)
+        run: |
+          echo "Listing files in repo root:"
+          ls -la
+
+      - name: Run auto_retrain.py
+        id: retrain_run
+        run: |
+          set -e
+          python scripts/auto_retrain.py
+        continue-on-error: false
+
+      - name: Check for changed files
+        id: git_changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          echo "=== git status (after adding) ==="
+          git status --porcelain
+          changed=$(git status --porcelain | wc -l)
+          echo "changed=$changed" >> $GITHUB_OUTPUT
+
+      - name: Commit & push model & logs (if changed)
+        if: steps.git_changes.outputs.changed != '0'
+        run: |
+          git add data/retrain_log.csv data/drift_metrics.json data/bad_timestamp_rows_for_drift.csv models || true
+          git commit -m "Auto retrain: update model/logs [skip ci]" || echo "No commit (maybe only binary changes)"
+          git push origin HEAD:main
+
+      # Optional: build and push docker image to Docker Hub (requires secrets)
+      - name: Login to Docker Hub
+        if: env.PUSH_DOCKER == 'true'
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & push Docker image
+        if: env.PUSH_DOCKER == 'true'
+        uses: docker/build-push-action@v4
+        with:
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/traffic-forecast-api:latest
+          context: .
